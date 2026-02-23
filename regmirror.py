@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+regmirror.py — Download container images to OCI tarballs and re-upload
+them to a private registry with domain rewriting.
+
+Usage:
+    # Download all images listed in images.txt to ./tarballs/
+    ./regmirror.py download -f images.txt -o ./tarballs
+
+    # Upload all tarballs to a private registry
+    ./regmirror.py upload -d ./tarballs -r my.registry.tld
+
+    # Download and upload in one go
+    ./regmirror.py sync -f images.txt -o ./tarballs -r my.registry.tld
+
+Requires: skopeo (https://github.com/containers/skopeo)
+
+The manifest.json file maps filenames to original image references,
+making the conversion fully reversible without fragile filename encoding.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Regex for parsing image references
+# ---------------------------------------------------------------------------
+IMAGE_RE = re.compile(
+    r"^(?P<registry>([\w.\-]+\.[\w.\-]+(:\d+)?|[\w.\-]+:\d+)(?=/[a-z0-9._-]+))?"
+    r"(?:/?)(?P<image>[a-z0-9._-]+(/[a-z0-9._-]+)*)"
+    r"(?::(?P<tag>[\w.\-]{1,127})|@(?P<digest>sha256:[a-fA-F0-9]{64}))?$",
+    re.IGNORECASE,
+)
+
+MANIFEST_FILE = "manifest.json"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def parse_image_ref(ref: str) -> dict:
+    """Parse an image reference into its components."""
+    ref = ref.strip()
+    m = IMAGE_RE.match(ref)
+    if not m:
+        raise ValueError(f"Cannot parse image reference: {ref}")
+    digest = m.group("digest")
+    return {
+        "registry": m.group("registry") or "docker.io",
+        "image": m.group("image"),
+        "tag": m.group("tag") or (None if digest else "latest"),
+        "digest": digest,
+        "original": ref,
+    }
+
+
+def ref_to_filename(ref: str) -> str:
+    """
+    Convert an image reference to a safe filename.
+    Uses a simple scheme: replace / with _ and : with -
+    The manifest.json provides the authoritative reverse mapping.
+    """
+    name = ref.replace("://", "")
+    # Handle @sha256: digests — keep only first 12 chars of hash
+    if "@sha256:" in name:
+        base, digest = name.split("@sha256:")
+        name = f"{base}@sha256-{digest[:12]}"
+    name = name.replace("/", "_").replace(":", "-")
+    return f"{name}.tar"
+
+
+def rewrite_for_registry(parsed: dict, target_registry: str) -> str:
+    """
+    Rewrite an image reference for a private registry.
+
+    docker.io/library/nginx:1.25  → my.registry.tld/dockerio/library/nginx:1.25
+    gcr.io/project/app:v1         → my.registry.tld/gcrio/project/app:v1
+    """
+    # Flatten source registry into a path component (remove dots and colons)
+    source = parsed["registry"]
+    registry_path = source.replace(".", "").replace(":", "")
+
+    image = parsed["image"]
+    tag_or_digest = ""
+    if parsed["digest"]:
+        tag_or_digest = f"@{parsed['digest']}"
+    elif parsed["tag"]:
+        tag_or_digest = f":{parsed['tag']}"
+    else:
+        tag_or_digest = ":latest"
+
+    return f"{target_registry}/{registry_path}/{image}{tag_or_digest}"
+
+
+def load_manifest(output_dir: Path) -> dict:
+    """Load or create the manifest file."""
+    manifest_path = output_dir / MANIFEST_FILE
+    if manifest_path.exists():
+        return json.loads(manifest_path.read_text())
+    return {}
+
+
+def save_manifest(output_dir: Path, manifest: dict) -> None:
+    """Save the manifest file."""
+    manifest_path = output_dir / MANIFEST_FILE
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def run_skopeo(args: list[str], dry_run: bool = False) -> bool:
+    """Run a skopeo command, return True on success."""
+    cmd = ["skopeo"] + args
+    log.info("Running: %s", " ".join(cmd))
+    if dry_run:
+        log.info("[DRY RUN] Would execute above command")
+        return True
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error("skopeo failed (exit code %d)", e.returncode)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+def cmd_download(args: argparse.Namespace) -> int:
+    """Download images listed in a file to OCI tarballs."""
+    images_file = Path(args.file)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not images_file.exists():
+        log.error("Images file not found: %s", images_file.resolve())
+        return 1
+
+    refs = [
+        line.strip()
+        for line in images_file.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    if not refs:
+        log.warning("No images found in %s", images_file)
+        return 1
+
+    log.info("Downloading %d image(s) to %s", len(refs), output_dir)
+
+    manifest = load_manifest(output_dir)
+    errors = 0
+    skipped = 0
+
+    for ref in refs:
+        try:
+            parsed = parse_image_ref(ref)
+        except ValueError as e:
+            log.error("%s", e)
+            errors += 1
+            continue
+
+        filename = ref_to_filename(ref)
+        tarball = output_dir / filename
+
+        if tarball.exists() and not args.force:
+            log.info("Skipping (exists): %s → %s", ref, filename)
+            skipped += 1
+        else:
+            log.info("Downloading: %s → %s", ref, filename)
+            src = f"docker://{ref}"
+            dst = f"oci-archive:{tarball}"
+
+            skopeo_args = ["copy"]
+            if args.src_tls_verify is not None:
+                skopeo_args.append(f"--src-tls-verify={'true' if args.src_tls_verify else 'false'}")
+            if args.src_creds:
+                skopeo_args += ["--src-creds", args.src_creds]
+            skopeo_args += [src, dst]
+
+            if not run_skopeo(skopeo_args, dry_run=args.dry_run):
+                errors += 1
+                continue
+
+        # Update manifest
+        manifest[filename] = {
+            "original": ref,
+            "registry": parsed["registry"],
+            "image": parsed["image"],
+            "tag": parsed["tag"],
+            "digest": parsed["digest"],
+        }
+
+    save_manifest(output_dir, manifest)
+    log.info(
+        "Done. %d downloaded, %d skipped, %d errors. Manifest: %s",
+        len(refs) - errors - skipped,
+        skipped,
+        errors,
+        output_dir / MANIFEST_FILE,
+    )
+    return 1 if errors else 0
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    """Upload tarballs to a private registry with domain rewriting."""
+    tarball_dir = Path(args.dir)
+    target_registry = args.registry.rstrip("/")
+
+    manifest = load_manifest(tarball_dir)
+    if not manifest:
+        log.error("No manifest.json found in %s. Run 'download' first.", tarball_dir)
+        return 1
+
+    log.info(
+        "Uploading %d image(s) to %s", len(manifest), target_registry
+    )
+
+    errors = 0
+    for filename, meta in manifest.items():
+        tarball = tarball_dir / filename
+        if not tarball.exists():
+            log.warning("Tarball not found, skipping: %s", filename)
+            errors += 1
+            continue
+
+        target_ref = rewrite_for_registry(meta, target_registry)
+        log.info("Uploading: %s → %s", filename, target_ref)
+
+        src = f"oci-archive:{tarball}"
+        dst = f"docker://{target_ref}"
+
+        skopeo_args = ["copy"]
+        if args.dest_tls_verify is not None:
+            skopeo_args.append(f"--dest-tls-verify={'true' if args.dest_tls_verify else 'false'}")
+        if args.dest_creds:
+            skopeo_args += ["--dest-creds", args.dest_creds]
+        skopeo_args += [src, dst]
+
+        if not run_skopeo(skopeo_args, dry_run=args.dry_run):
+            errors += 1
+
+    log.info("Done. %d uploaded, %d errors.", len(manifest) - errors, errors)
+    return 1 if errors else 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Download + upload in one go."""
+    ret = cmd_download(args)
+    if ret != 0 and not args.continue_on_error:
+        log.error("Download had errors, aborting upload. Use --continue-on-error to proceed.")
+        return ret
+    args.dir = args.output  # upload reads from --dir
+    return cmd_upload(args)
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List manifest contents and show what the upload targets would be."""
+    tarball_dir = Path(args.dir)
+    manifest = load_manifest(tarball_dir)
+    if not manifest:
+        log.error("No manifest.json found in %s", tarball_dir)
+        return 1
+
+    target_registry = args.registry
+
+    print(f"{'Filename':<55} {'Original':<45} {'Upload Target'}")
+    print("-" * 150)
+    for filename, meta in manifest.items():
+        original = meta["original"]
+        target = rewrite_for_registry(meta, target_registry) if target_registry else "—"
+        print(f"{filename:<55} {original:<45} {target}")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Mirror container images via OCI tarballs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print commands without executing"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # -- download --
+    dl = sub.add_parser("download", help="Download images to tarballs")
+    dl.add_argument("-f", "--file", required=True, help="Text file with image refs")
+    dl.add_argument("-o", "--output", default="./tarballs", help="Output directory")
+    dl.add_argument("--force", action="store_true", help="Re-download existing tarballs")
+    dl.add_argument(
+        "--src-tls-verify",
+        default=None,
+        type=lambda x: x.lower() not in ("false", "0", "no"),
+        dest="src_tls_verify",
+        metavar="BOOL",
+        help="TLS verification for source registry (e.g. --src-tls-verify=false)",
+    )
+    dl.add_argument(
+        "--src-creds", default=None, metavar="USER:PASS",
+        help="Credentials for source registry",
+    )
+
+    # -- upload --
+    ul = sub.add_parser("upload", help="Upload tarballs to a registry")
+    ul.add_argument("-d", "--dir", default="./tarballs", help="Tarball directory")
+    ul.add_argument("-r", "--registry", required=True, help="Target registry URL")
+    ul.add_argument(
+        "--dest-tls-verify",
+        default=None,
+        type=lambda x: x.lower() not in ("false", "0", "no"),
+        dest="dest_tls_verify",
+        metavar="BOOL",
+        help="TLS verification for destination registry (e.g. --dest-tls-verify=false)",
+    )
+    ul.add_argument(
+        "--dest-creds", default=None, metavar="USER:PASS",
+        help="Credentials for destination registry",
+    )
+
+    # -- sync --
+    sy = sub.add_parser("sync", help="Download + upload in one step")
+    sy.add_argument("-f", "--file", required=True, help="Text file with image refs")
+    sy.add_argument("-o", "--output", default="./tarballs", help="Output directory")
+    sy.add_argument("-r", "--registry", required=True, help="Target registry URL")
+    sy.add_argument("--force", action="store_true", help="Re-download existing tarballs")
+    sy.add_argument(
+        "--continue-on-error", action="store_true", dest="continue_on_error",
+        help="Continue with upload even if some downloads failed",
+    )
+    sy.add_argument(
+        "--src-tls-verify", default=None, dest="src_tls_verify", metavar="BOOL",
+        type=lambda x: x.lower() not in ("false", "0", "no"),
+    )
+    sy.add_argument(
+        "--dest-tls-verify", default=None, dest="dest_tls_verify", metavar="BOOL",
+        type=lambda x: x.lower() not in ("false", "0", "no"),
+    )
+    sy.add_argument("--src-creds", default=None, metavar="USER:PASS",
+                    help="Credentials for source registry")
+    sy.add_argument("--dest-creds", default=None, metavar="USER:PASS",
+                    help="Credentials for destination registry")
+
+    # -- list --
+    ls = sub.add_parser("list", help="Show manifest and upload targets")
+    ls.add_argument("-d", "--dir", default="./tarballs", help="Tarball directory")
+    ls.add_argument("-r", "--registry", default=None, help="Preview upload targets")
+
+    args = parser.parse_args()
+    commands = {
+        "download": cmd_download,
+        "upload": cmd_upload,
+        "sync": cmd_sync,
+        "list": cmd_list,
+    }
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
