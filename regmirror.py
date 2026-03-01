@@ -29,11 +29,49 @@ import subprocess
 import sys
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# ---------------------------------------------------------------------------
+# Author / version
+# ---------------------------------------------------------------------------
+__version__ = "1.1.0"
+__author__ = "WatskeBart"
+__description__ = "regmirror — mirror container images via OCI tarballs"
+
+# ---------------------------------------------------------------------------
+# Colored logging
+# ---------------------------------------------------------------------------
+class _ColorFormatter(logging.Formatter):
+    _LEVEL_COLORS = {
+        logging.DEBUG:    "\033[36m",    # cyan
+        logging.INFO:     "\033[32m",    # green
+        logging.WARNING:  "\033[33m",    # yellow
+        logging.ERROR:    "\033[31m",    # red
+        logging.CRITICAL: "\033[1;31m",  # bold red
+    }
+    _DIM   = "\033[2m"
+    _RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self._LEVEL_COLORS.get(record.levelno, "")
+        record = logging.makeLogRecord(record.__dict__)  # don't mutate original
+        record.asctime   = f"{self._DIM}{self.formatTime(record, self.datefmt)}{self._RESET}"
+        record.levelname = f"{color}{record.levelname}{self._RESET}"
+        record.msg       = f"{color}{record.getMessage()}{self._RESET}"
+        record.args      = None  # already interpolated above
+        return f"{record.asctime} [{record.levelname}] {record.msg}"
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    if sys.stderr.isatty():
+        handler.setFormatter(_ColorFormatter(datefmt="%H:%M:%S"))
+    else:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+        ))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+_setup_logging()
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -188,6 +226,10 @@ def cmd_download(args: argparse.Namespace) -> int:
                 skopeo_args.append(f"--src-tls-verify={'true' if args.src_tls_verify else 'false'}")
             if args.src_creds:
                 skopeo_args += ["--src-creds", args.src_creds]
+            if getattr(args, "authfile", None):
+                skopeo_args += ["--src-authfile", args.authfile]
+            if getattr(args, "remove_signatures", False):
+                skopeo_args.append("--remove-signatures")
             skopeo_args += [src, dst]
 
             if not run_skopeo(skopeo_args, dry_run=args.dry_run):
@@ -247,6 +289,10 @@ def cmd_upload(args: argparse.Namespace) -> int:
             skopeo_args.append(f"--dest-tls-verify={'true' if args.dest_tls_verify else 'false'}")
         if args.dest_creds:
             skopeo_args += ["--dest-creds", args.dest_creds]
+        if getattr(args, "authfile", None):
+            skopeo_args += ["--dest-authfile", args.authfile]
+        if getattr(args, "remove_signatures", False):
+            skopeo_args.append("--remove-signatures")
         skopeo_args += [src, dst]
 
         if not run_skopeo(skopeo_args, dry_run=args.dry_run):
@@ -296,6 +342,9 @@ def main() -> int:
         epilog=__doc__,
     )
     parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__} — {__description__}"
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Print commands without executing"
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -317,6 +366,14 @@ def main() -> int:
         "--src-creds", default=None, metavar="USER:PASS",
         help="Credentials for source registry",
     )
+    dl.add_argument(
+        "--authfile", default=None, metavar="FILE",
+        help="Path to auth.json for authenticating to source registry",
+    )
+    dl.add_argument(
+        "--remove-signatures", action="store_true", dest="remove_signatures",
+        help="Strip image signatures (avoids errors when saving to oci-archive)",
+    )
 
     # -- upload --
     ul = sub.add_parser("upload", help="Upload tarballs to a registry")
@@ -333,6 +390,14 @@ def main() -> int:
     ul.add_argument(
         "--dest-creds", default=None, metavar="USER:PASS",
         help="Credentials for destination registry",
+    )
+    ul.add_argument(
+        "--authfile", default=None, metavar="FILE",
+        help="Path to auth.json for authenticating to destination registry",
+    )
+    ul.add_argument(
+        "--remove-signatures", action="store_true", dest="remove_signatures",
+        help="Strip image signatures (avoids errors when pushing to a registry)",
     )
 
     # -- sync --
@@ -357,6 +422,14 @@ def main() -> int:
                     help="Credentials for source registry")
     sy.add_argument("--dest-creds", default=None, metavar="USER:PASS",
                     help="Credentials for destination registry")
+    sy.add_argument(
+        "--authfile", default=None, metavar="FILE",
+        help="Path to auth.json used for both source and destination registries",
+    )
+    sy.add_argument(
+        "--remove-signatures", action="store_true", dest="remove_signatures",
+        help="Strip image signatures during copy",
+    )
 
     # -- list --
     ls = sub.add_parser("list", help="Show manifest and upload targets")
@@ -374,4 +447,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+        sys.exit(130)
