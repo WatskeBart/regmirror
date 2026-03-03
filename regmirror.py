@@ -32,7 +32,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Author / version
 # ---------------------------------------------------------------------------
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "WatskeBart"
 __description__ = "regmirror — mirror container images via OCI tarballs"
 
@@ -158,6 +158,28 @@ def save_manifest(output_dir: Path, manifest: dict) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
+def get_remote_digest(ref: str, args: argparse.Namespace) -> str | None:
+    """
+    Query the registry for the current manifest digest of an image reference.
+    Returns a 'sha256:...' string, or None if the check fails (network error,
+    auth failure, etc.).  Uses DEBUG logging so it doesn't clutter normal output.
+    """
+    cmd = ["skopeo", "inspect"]
+    if getattr(args, "src_tls_verify", None) is not None:
+        cmd.append(f"--tls-verify={'true' if args.src_tls_verify else 'false'}")
+    if getattr(args, "src_creds", None):
+        cmd += ["--creds", args.src_creds]
+    if getattr(args, "authfile", None):
+        cmd += ["--authfile", args.authfile]
+    cmd.append(f"docker://{ref}")
+    log.debug("Checking remote digest: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout).get("Digest")
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
 def run_skopeo(args: list[str], dry_run: bool = False) -> bool:
     """Run a skopeo command, return True on success."""
     cmd = ["skopeo"] + args
@@ -213,10 +235,39 @@ def cmd_download(args: argparse.Namespace) -> int:
         filename = ref_to_filename(ref)
         tarball = output_dir / filename
 
+        remote_digest = None
+        needs_download = True
+
         if tarball.exists() and not args.force:
-            log.info("Skipping (exists): %s → %s", ref, filename)
-            skipped += 1
-        else:
+            if parsed["digest"]:
+                # Digest-pinned refs are immutable — the content can never change.
+                log.info("Skipping (digest-pinned): %s → %s", ref, filename)
+                skipped += 1
+                needs_download = False
+            else:
+                # Tag-based ref: compare the stored digest to what's on the registry now.
+                stored_digest = manifest.get(filename, {}).get("digest")
+                remote_digest = get_remote_digest(ref, args)
+                if remote_digest is None:
+                    log.warning(
+                        "Could not fetch remote digest for %s — skipping (use --force to re-download anyway)",
+                        ref,
+                    )
+                    skipped += 1
+                    needs_download = False
+                elif remote_digest == stored_digest:
+                    log.info("Skipping (up to date): %s → %s", ref, filename)
+                    skipped += 1
+                    needs_download = False
+                else:
+                    log.info(
+                        "Tag %s points to a newer image (stored: %s, remote: %s) — re-downloading",
+                        ref,
+                        stored_digest[:19] if stored_digest else "none",
+                        remote_digest[:19],
+                    )
+
+        if needs_download:
             log.info("Downloading: %s → %s", ref, filename)
             src = f"docker://{ref}"
             dst = f"oci-archive:{tarball}"
@@ -236,13 +287,18 @@ def cmd_download(args: argparse.Namespace) -> int:
                 errors += 1
                 continue
 
-        # Update manifest
+            # Resolve the digest for tag-based refs after a successful download
+            # so we can detect future updates on the next run.
+            if not parsed["digest"] and remote_digest is None:
+                remote_digest = get_remote_digest(ref, args)
+
+        # Update manifest, preserving any previously-stored digest if we have nothing better.
         manifest[filename] = {
             "original": ref,
             "registry": parsed["registry"],
             "image": parsed["image"],
             "tag": parsed["tag"],
-            "digest": parsed["digest"],
+            "digest": remote_digest or parsed["digest"] or manifest.get(filename, {}).get("digest"),
         }
 
     save_manifest(output_dir, manifest)
