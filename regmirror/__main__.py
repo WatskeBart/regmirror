@@ -80,7 +80,7 @@ log = logging.getLogger(__name__)
 # Regex for parsing image references
 # ---------------------------------------------------------------------------
 IMAGE_RE = re.compile(
-    r"^(?P<registry>([\w.\-]+\.[\w.\-]+(:\d+)?|[\w.\-]+:\d+)(?=/[a-z0-9._-]+))?"
+    r"^(?P<registry>([\w.\-]+(\.[\w.\-])+(:\d+)?|[\w.\-]+:\d+)(?=/[a-z0-9._-]+))?"
     r"(?:/?)(?P<image>[a-z0-9._-]+(/[a-z0-9._-]+)*)"
     r"(?::(?P<tag>[\w.\-]{1,127})|@(?P<digest>sha256:[a-fA-F0-9]{64}))?$",
     re.IGNORECASE,
