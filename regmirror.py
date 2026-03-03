@@ -22,12 +22,14 @@ making the conversion fully reversible without fragile filename encoding.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Author / version
@@ -158,13 +160,26 @@ def save_manifest(output_dir: Path, manifest: dict) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def get_remote_digest(ref: str, args: argparse.Namespace) -> str | None:
+class RemoteInfo(NamedTuple):
+    digest: str | None
+    has_embedded_signatures: bool
+
+
+def inspect_remote(ref: str, args: argparse.Namespace) -> RemoteInfo:
     """
-    Query the registry for the current manifest digest of an image reference.
-    Returns a 'sha256:...' string, or None if the check fails (network error,
-    auth failure, etc.).  Uses DEBUG logging so it doesn't clutter normal output.
+    Fetch the raw manifest for a remote image via skopeo inspect --raw.
+
+    Returns:
+      - digest: sha256 of the raw manifest bytes (equivalent to the registry's
+        Docker-Content-Digest header), or None on failure.
+      - has_embedded_signatures: True when the manifest JSON contains a
+        'signatures' key (old-style Docker Content Trust / Notary v1 signing).
+        Modern cosign/sigstore signatures are stored as separate OCI artifacts
+        and are NOT detected here — skopeo copy handles them independently.
+
+    A single network call provides both pieces of information.
     """
-    cmd = ["skopeo", "inspect"]
+    cmd = ["skopeo", "inspect", "--raw"]
     if getattr(args, "src_tls_verify", None) is not None:
         cmd.append(f"--tls-verify={'true' if args.src_tls_verify else 'false'}")
     if getattr(args, "src_creds", None):
@@ -172,12 +187,15 @@ def get_remote_digest(ref: str, args: argparse.Namespace) -> str | None:
     if getattr(args, "authfile", None):
         cmd += ["--authfile", args.authfile]
     cmd.append(f"docker://{ref}")
-    log.debug("Checking remote digest: %s", " ".join(cmd))
+    log.debug("Inspecting remote manifest: %s", " ".join(cmd))
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return json.loads(result.stdout).get("Digest")
+        result = subprocess.run(cmd, check=True, capture_output=True)
+        raw = result.stdout
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        has_sigs = bool(json.loads(raw).get("signatures"))
+        return RemoteInfo(digest=digest, has_embedded_signatures=has_sigs)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
+        return RemoteInfo(digest=None, has_embedded_signatures=False)
 
 
 def run_skopeo(args: list[str], dry_run: bool = False) -> bool:
@@ -235,7 +253,7 @@ def cmd_download(args: argparse.Namespace) -> int:
         filename = ref_to_filename(ref)
         tarball = output_dir / filename
 
-        remote_digest = None
+        remote_info: RemoteInfo | None = None
         needs_download = True
 
         if tarball.exists() and not args.force:
@@ -245,17 +263,17 @@ def cmd_download(args: argparse.Namespace) -> int:
                 skipped += 1
                 needs_download = False
             else:
-                # Tag-based ref: compare the stored digest to what's on the registry now.
+                # Tag-based ref: inspect the remote manifest to get digest + signature info.
                 stored_digest = manifest.get(filename, {}).get("digest")
-                remote_digest = get_remote_digest(ref, args)
-                if remote_digest is None:
+                remote_info = inspect_remote(ref, args)
+                if remote_info.digest is None:
                     log.warning(
                         "Could not fetch remote digest for %s — skipping (use --force to re-download anyway)",
                         ref,
                     )
                     skipped += 1
                     needs_download = False
-                elif remote_digest == stored_digest:
+                elif remote_info.digest == stored_digest:
                     log.info("Skipping (up to date): %s → %s", ref, filename)
                     skipped += 1
                     needs_download = False
@@ -264,10 +282,14 @@ def cmd_download(args: argparse.Namespace) -> int:
                         "Tag %s points to a newer image (stored: %s, remote: %s) — re-downloading",
                         ref,
                         stored_digest[:19] if stored_digest else "none",
-                        remote_digest[:19],
+                        remote_info.digest[:19],
                     )
 
         if needs_download:
+            # Inspect the remote manifest if we haven't already (first download or --force).
+            if remote_info is None and not parsed["digest"]:
+                remote_info = inspect_remote(ref, args)
+
             log.info("Downloading: %s → %s", ref, filename)
             src = f"docker://{ref}"
             dst = f"oci-archive:{tarball}"
@@ -279,26 +301,28 @@ def cmd_download(args: argparse.Namespace) -> int:
                 skopeo_args += ["--src-creds", args.src_creds]
             if getattr(args, "authfile", None):
                 skopeo_args += ["--src-authfile", args.authfile]
-            if getattr(args, "remove_signatures", False):
+
+            # Auto-detect embedded signatures; also honour the explicit --remove-signatures flag.
+            auto_remove = remote_info is not None and remote_info.has_embedded_signatures
+            if auto_remove and not getattr(args, "remove_signatures", False):
+                log.info("Embedded signatures detected in %s — stripping automatically", ref)
+            if getattr(args, "remove_signatures", False) or auto_remove:
                 skopeo_args.append("--remove-signatures")
+
             skopeo_args += [src, dst]
 
             if not run_skopeo(skopeo_args, dry_run=args.dry_run):
                 errors += 1
                 continue
 
-            # Resolve the digest for tag-based refs after a successful download
-            # so we can detect future updates on the next run.
-            if not parsed["digest"] and remote_digest is None:
-                remote_digest = get_remote_digest(ref, args)
-
         # Update manifest, preserving any previously-stored digest if we have nothing better.
+        resolved_digest = (remote_info.digest if remote_info else None) or parsed["digest"]
         manifest[filename] = {
             "original": ref,
             "registry": parsed["registry"],
             "image": parsed["image"],
             "tag": parsed["tag"],
-            "digest": remote_digest or parsed["digest"] or manifest.get(filename, {}).get("digest"),
+            "digest": resolved_digest or manifest.get(filename, {}).get("digest"),
         }
 
     save_manifest(output_dir, manifest)

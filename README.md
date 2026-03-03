@@ -83,10 +83,12 @@ Every `download` run writes a `manifest.json` into the tarball directory. This f
     "registry": "docker.io",
     "image": "library/nginx",
     "tag": "1.25",
-    "digest": null
+    "digest": "sha256:a484819eb60211f5299034ac80f6a681b06f89e476600f94c25bde91c7f7e88c"
   }
 }
 ```
+
+After a successful download the resolved `sha256:` digest is stored alongside the tag. On subsequent runs `regmirror` uses this digest to detect whether the tag now points to a newer image — if it does, the tarball is re-downloaded automatically. Use `--force` to re-download unconditionally regardless of the stored digest.
 
 The `upload` and `list` commands require this file to be present.
 
@@ -98,9 +100,11 @@ The `upload` and `list` commands require this file to be present.
 | ------ | --------- | ------------- |
 | `-f`, `--file` | *(required)* | Text file with image references |
 | `-o`, `--output` | `./tarballs` | Directory to write tarballs and manifest |
-| `--force` | false | Re-download tarballs that already exist |
+| `--force` | false | Re-download tarballs unconditionally, ignoring stored digest |
 | `--src-tls-verify BOOL` | — | Override TLS verification for the source registry |
 | `--src-creds USER:PASS` | — | Credentials for the source registry |
+| `--authfile FILE` | — | Path to a Docker-compatible `auth.json` |
+| `--remove-signatures` | auto | Strip embedded image signatures; applied automatically when detected, or pass explicitly to always strip |
 
 ### `upload`
 
@@ -110,6 +114,8 @@ The `upload` and `list` commands require this file to be present.
 | `-r`, `--registry` | *(required)* | Target registry (e.g. `my.registry.tld`) |
 | `--dest-tls-verify BOOL` | — | Override TLS verification for the target registry |
 | `--dest-creds USER:PASS` | — | Credentials for the target registry |
+| `--authfile FILE` | — | Path to a Docker-compatible `auth.json` |
+| `--remove-signatures` | false | Strip image signatures during push |
 
 ### `sync`
 
@@ -131,3 +137,4 @@ Accepts all flags from both `download` and `upload`, plus:
 | Flag | Description |
 | ------ | ------------- |
 | `--dry-run` | Print skopeo commands without executing them |
+| `--version` | Print version and exit |
