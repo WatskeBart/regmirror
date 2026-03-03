@@ -34,7 +34,7 @@ from typing import NamedTuple
 # ---------------------------------------------------------------------------
 # Author / version
 # ---------------------------------------------------------------------------
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __author__ = "WatskeBart"
 __description__ = "regmirror — mirror container images via OCI tarballs"
 
