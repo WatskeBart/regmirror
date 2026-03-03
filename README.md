@@ -14,14 +14,27 @@ Air-gapped or restricted environments often can't reach public registries direct
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - [`skopeo`](https://github.com/containers/skopeo) installed and on `$PATH`
 
 ## Installation
 
 ```bash
-git clone <repo>
-chmod +x regmirror.py
+uv tool install regmirror
+```
+
+Or run without installing:
+
+```bash
+uvx regmirror
+```
+
+Alternatively with pipx/pip:
+
+```bash
+pipx install regmirror
+# or
+pip install regmirror
 ```
 
 ## Usage
@@ -131,6 +144,38 @@ Accepts all flags from both `download` and `upload`, plus:
 | ------ | --------- | ------------- |
 | `-d`, `--dir` | `./tarballs` | Directory containing the manifest |
 | `-r`, `--registry` | — | Preview what the upload targets would be |
+
+## Building the package
+
+Install the build tools:
+
+```bash
+pip install build hatchling
+```
+
+Build both the wheel and source distribution:
+
+```bash
+python -m build
+```
+
+This outputs `dist/regmirror-<version>-py3-none-any.whl` and
+`dist/regmirror-<version>.tar.gz`.
+
+Install locally to test before publishing:
+
+```bash
+uv tool install dist/regmirror-*.whl
+# or
+pipx install dist/regmirror-*.whl
+```
+
+Publish to PyPI:
+
+```bash
+pip install twine
+twine upload dist/*
+```
 
 ## Global flags
 

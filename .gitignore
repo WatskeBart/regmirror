@@ -1,0 +1,11 @@
+# Build output
+dist/
+*.egg-info/
+
+# Python runtime
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
