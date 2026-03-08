@@ -26,5 +26,12 @@ Changelog = "https://github.com/WatskeBart/regmirror/blob/main/CHANGELOG.md"
 [project.scripts]
 regmirror = "regmirror.__main__:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov"]
+
 [tool.hatch.version]
 path = "regmirror/__main__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires Docker and skopeo installed"]

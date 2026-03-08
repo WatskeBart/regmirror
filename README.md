@@ -145,6 +145,44 @@ Accepts all flags from both `download` and `upload`, plus:
 | `-d`, `--dir` | `./tarballs` | Directory containing the manifest |
 | `-r`, `--registry` | — | Preview what the upload targets would be |
 
+## Testing
+
+Install the dev dependencies:
+
+```bash
+pip install -e ".[dev]"
+# or
+uv pip install -e ".[dev]"
+```
+
+### Unit tests
+
+No external tools required — skopeo calls are mocked.
+
+```bash
+pytest tests/ --ignore=tests/integration -v
+```
+
+Run with coverage:
+
+```bash
+pytest tests/ --ignore=tests/integration --cov=regmirror --cov-report=term-missing
+```
+
+### Integration tests
+
+Requires [Podman](https://podman.io/docs/installation) and
+[`skopeo`](https://github.com/containers/skopeo) installed on the host.
+A `registry:3` container is started automatically on port `5001` for the
+duration of the test session.
+
+```bash
+pytest tests/integration/ -v
+```
+
+The integration tests download `busybox:1.36` from a public registry, upload it
+to the local registry, and verify it is reachable via `skopeo inspect`.
+
 ## Building the package
 
 Install the build tools:
