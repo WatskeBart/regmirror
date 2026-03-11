@@ -150,8 +150,6 @@ Accepts all flags from both `download` and `upload`, plus:
 Install the dev dependencies:
 
 ```bash
-pip install -e ".[dev]"
-# or
 uv pip install -e ".[dev]"
 ```
 
@@ -160,13 +158,13 @@ uv pip install -e ".[dev]"
 No external tools required — skopeo calls are mocked.
 
 ```bash
-pytest tests/ --ignore=tests/integration -v
+uv run pytest tests/ --ignore=tests/integration -v
 ```
 
 Run with coverage:
 
 ```bash
-pytest tests/ --ignore=tests/integration --cov=regmirror --cov-report=term-missing
+uv run pytest tests/ --ignore=tests/integration --cov=regmirror --cov-report=term-missing
 ```
 
 ### Integration tests
@@ -177,7 +175,7 @@ A `registry:3` container is started automatically on port `5001` for the
 duration of the test session.
 
 ```bash
-pytest tests/integration/ -v
+uv run pytest tests/integration/ -v
 ```
 
 The integration tests download `busybox:1.36` from a public registry, upload it

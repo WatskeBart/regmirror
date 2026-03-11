@@ -12,4 +12,4 @@ venv/
 
 # PyTest cache
 .pytest_cache/
-.coverage
+*.coverage
