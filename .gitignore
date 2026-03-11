@@ -9,3 +9,7 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# PyTest cache
+.pytest_cache/
+.coverage
