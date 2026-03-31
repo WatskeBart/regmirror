@@ -1,3 +1,5 @@
+# ARCHIVED since the discovery of [Hauler](https://github.com/hauler-dev/hauler)
+
 # regmirror
 
 Mirror container images through OCI tarballs to a private registry.
